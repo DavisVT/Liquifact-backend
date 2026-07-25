@@ -20,12 +20,7 @@ const storageService = require('../../services/storage');
 const { extractTenant } = require('../../middleware/tenant');
 const idempotencyMiddleware = require('../../middleware/idempotency');
 const logger = require('../../logger');
-const {
-  presignedUploadBodySchema,
-  directUploadBodySchema,
-  validatePersistenceBody,
-  MAX_FILE_SIZE_BYTES,
-} = require('../../schemas/persistence');
+const { instrumentPersistence } = require('../../middleware/persistenceMetrics');
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -72,20 +67,15 @@ router.post(
       res.status(500).json({ error: 'Failed to generate presigned upload URL' });
     }
   }
-);
+}));
 
 // POST /api/sme/invoice - Upload PDF invoice
-router.post(
-  '/invoice',
-  upload.single('invoice'),
-  extractTenant,
-  validatePersistenceBody(directUploadBodySchema),
-  async (req, res) => {
-    const requestLogger = logger.createRequestLogger(req);
-    try {
-      if (!req.file) {
-        return res.status(400).json({ error: 'Invoice file is required' });
-      }
+router.post('/invoice', upload.single('invoice'), extractTenant, instrumentPersistence('sme_invoice_upload', async (req, res) => {
+  const requestLogger = logger.createRequestLogger(req);
+  try {
+    if (!req.file) {
+      return res.status(400).json({ error: 'Invoice file is required' });
+    }
 
       const tenantId = req.tenantId;
       const invoiceId = req.validated.invoiceId || crypto.randomUUID();

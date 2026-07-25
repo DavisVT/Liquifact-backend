@@ -38,11 +38,13 @@ const {
   payloadTooLargeHandler,
   urlencodedBodyLimit,
 } = require('./middleware/bodySizeLimits');
+const healthRoutes = require('./routes/health');
 const { performHealthChecks, performReadinessChecks } = require('./services/health');
 const { validateHealthQuery, rejectBodyOnGet } = require('./schemas/health');
 const responseHelper = require('./utils/responseHelper');
 const logger = require('./logger');
 const { metricsAuth, metricsHandler } = require('./metrics');
+const { instrumentHealth } = require('./middleware/healthMetrics');
 const smeRoutes = require('./routes/sme');
 const invoiceFileRoutes = require('./routes/invoiceFile');
 const auditTrailRoutes = require('./routes/auditTrail');
@@ -157,29 +159,33 @@ function createApp() {
   // ── 4. Routes ────────────────────────────────────────────────────────────
 
   // ── Health / Liveness / Readiness ──────────────────────────────────────
+  // Issue #769 — per-client rate limiter before individual handlers.
+  // Mounted first so monitoring scrapers and K8s probes all share the same
+  // per-client budget and a flood of unauthenticated requests is gated
+  // before it reaches the dependency checks.
 
   // Liveness probe — no external dependencies
-  app.get('/health', rejectBodyOnGet, validateHealthQuery, (req, res) => {
+  app.get('/health', rejectBodyOnGet, validateHealthQuery, instrumentHealth('health_liveness', (req, res) => {
     res.json({
       status: 'ok',
       service: 'liquifact-api',
       version: '0.1.0',
       timestamp: new Date().toISOString(),
     });
-  });
+  }));
 
   // Liveness alias (Kubernetes convention)
-  app.get('/healthz', rejectBodyOnGet, validateHealthQuery, (req, res) => {
+  app.get('/healthz', rejectBodyOnGet, validateHealthQuery, instrumentHealth('health_liveness', (req, res) => {
     res.json({
       status: 'ok',
       service: 'liquifact-api',
       version: '0.1.0',
       timestamp: new Date().toISOString(),
     });
-  });
+  }));
 
   // Full health check (all dependencies)
-  app.get('/ready', rejectBodyOnGet, validateHealthQuery, async (req, res) => {
+  app.get('/ready', rejectBodyOnGet, validateHealthQuery, instrumentHealth('health_full', async (req, res) => {
     try {
       const { healthy, checks } = await performHealthChecks();
       const status = healthy ? 200 : 503;
@@ -198,10 +204,10 @@ function createApp() {
         error: error.message,
       });
     }
-  });
+  }));
 
   // Readiness probe (critical deps only: DB, Soroban RPC)
-  app.get('/readyz', rejectBodyOnGet, validateHealthQuery, async (req, res) => {
+  app.get('/readyz', rejectBodyOnGet, validateHealthQuery, instrumentHealth('health_readiness', async (req, res) => {
     try {
       const { healthy, checks } = await performReadinessChecks();
       const status = healthy ? 200 : 503;
@@ -220,7 +226,7 @@ function createApp() {
         error: error.message,
       });
     }
-  });
+  }));
 
   // API info
   app.get('/api', (req, res) => {
@@ -380,6 +386,7 @@ function createApp() {
   mountFeatureRouter(app, '/api/investor', investorRoutes);
   mountFeatureRouter(app, '/api/kyc', kycRoutes);
   mountFeatureRouter(app, '/api/marketplace', marketplaceRoutes);
+  mountFeatureRouter(app, '/api/health', healthRoutes);
   mountFeatureRouter(app, '/api/retention', retentionRoutes);
   mountFeatureRouter(app, '/api/admin/audit', auditTrailRoutes);
   mountFeatureRouter(app, '/api/admin/escrow', adminEscrowRoutes);
@@ -388,11 +395,15 @@ function createApp() {
   mountFeatureRouter(app, '/api/admin/reconciliation', reconciliationRoutes);
   mountFeatureRouter(app, '/api/admin/indexer', adminIndexerRoutes);
   mountFeatureRouter(app, '/v1', v1Routes);
+  mountFeatureRouter(app, '/api', apiKeysRoutes);
 
   assertNoDuplicateRouterMounts();
 
   // ── 6. Prometheus metrics ────────────────────────────────────────────────
-  app.get('/metrics', metricsAuth, metricsHandler);
+  // Rate limiter mounted BEFORE metricsAuth so unauthenticated attempts
+  // still consume quota — defending against brute-force token guessing
+  // on the metrics surface (issue #744).
+  app.get('/metrics', metricsLimiter, metricsAuth, metricsHandler);
 
   // ── 7. 404 catch-all ─────────────────────────────────────────────────────
   app.use((req, res) => {

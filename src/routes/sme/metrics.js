@@ -141,10 +141,9 @@ router.get('/metrics', authenticateToken, extractTenant, async (req, res, next) 
     try {
       result = await invoiceService.getSmeInvoiceList(tenantId, userId, { cursor, limit });
     } catch (err) {
-      if (err instanceof CursorError) {
+      if (err.name === 'CursorError' || err instanceof CursorError) {
         return res.status(400).json({
-          error: 'Bad Request',
-          message: err.message
+          error: { message: err.message },
         });
       }
       throw err;
